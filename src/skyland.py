@@ -175,14 +175,28 @@ def refresh_token():
 
 def get_binding_list():
     v = []
-    resp = requests.get(binding_url, headers=get_sign_header(binding_url, 'get', None, http_local.header)).json()
-
-    if resp['code'] != 0:
-        logging.error(f"请求角色列表出现问题：{resp['message']}")
-        if resp.get('message') == '用户未登录':
+    tests = [0,1,-1,2,-2,3,-3,4,-4,5,-5]
+    headers = get_sign_header(binding_url, 'get', None, http_local.header)
+    is_success = False
+    resp = None
+    for time_delta in tests:
+        ori_time = int(time.time())
+        headers_modified = headers
+        headers_modified['timestamp'] = str(ori_time + time_delta)
+        resp = requests.get(binding_url, headers=headers_modified)
+        j = resp.json()
+        if j['message'] == '用户未登录':
             logging.error(f'用户登录可能失效了，请重新运行此程序！')
             os.remove(token_save_name)
             return []
+        if j['code'] == 0:
+            is_success = True
+            break;
+
+    if is_success != True:
+        logging.error(f"请求角色列表出现问题")
+    resp = resp.json()
+    print(resp)
     for i in resp['data']['list']:
         # 也许有些游戏没有签到功能？
         if i.get('appCode') not in ('arknights', 'endfield'):
@@ -201,13 +215,28 @@ def sign_for_arknights(data: dict):
     }
     url = sign_url_mapping['arknights']
     headers = get_sign_header(url, 'post', body, http_local.header)
-    resp = requests.post(url, headers=headers, json=body).json()
+    tests = [0,1,-1,2,-2,3,-3,4,-4,5,-5]
+    is_success = False
+    for time_delta in tests:
+        ori_time = int(time.time())
+        headers_modified = headers
+        headers_modified['timestamp'] = str(ori_time + time_delta)
+        resp = requests.post(url, headers=headers, json=body).json()
+        if resp.get('code') == 0:
+            is_success = True
+            break;
+        else:
+            if str(resp.get('message')) == "请勿重复签到！":
+                print("重复签到")
+                break;
+            print("时间偏移"+str(time_delta)+"签到失败")
+            print(resp)
     game_name = data.get('gameName')
     channel = data.get("channelName")
     nickname = data.get('nickName') or ''
-    if resp.get('code') != 0:
+    if is_success != True:
         return [
-            f'[{game_name}]角色{nickname}({channel})签到失败了！原因：{resp["message"]}']
+            f'[{game_name}]角色{nickname}({channel})签到失败了！']
     result = ''
     awards = resp['data']['awards']
     for j in awards:
@@ -223,10 +252,27 @@ def sign_for_endfield(data: dict):
     result = []
     for i in roles:
         nickname = i.get('nickname') or ''
-        resp = do_sign_for_endfield(i)
-        j = resp.json()
-        if j['code'] != 0:
-            result.append(f'[{game_name}]角色{nickname}({channel})签到失败了！原因:{j["message"]}')
+        url = sign_url_mapping['endfield']
+        headers = get_sign_header(url, 'post', None, http_local.header)
+        tests = [0,1,-1,2,-2,3,-3,4,-4,5,-5]
+        is_success = False
+        for time_delta in tests:
+            ori_time = int(time.time())
+            headers_modified = headers
+            headers_modified['timestamp'] = str(ori_time + time_delta)
+            resp = do_sign_for_endfield(i, headers)
+            j = resp.json()
+            if j['code'] == 0:
+                is_success = True
+                break;
+            else:
+                if str(j['message']) == "请勿重复签到！":
+                    print("重复签到")
+                    break;
+                print("时间偏移"+str(time_delta)+"签到失败")
+                print(resp)
+        if is_success != True:
+            result.append(f'[{game_name}]角色{nickname}({channel})签到失败了！')
         else:
             awards_result = []
             result_data: dict = j['data']
@@ -242,9 +288,8 @@ def sign_for_endfield(data: dict):
     return result
 
 
-def do_sign_for_endfield(role: dict):
+def do_sign_for_endfield(role: dict, headers):
     url = sign_url_mapping['endfield']
-    headers = get_sign_header(url, 'post', None, http_local.header)
     headers.update({
         'Content-Type': 'application/json',
         # FIXME b服不知道是不是这样
