@@ -65,7 +65,7 @@ cred_code_url = "https://zonai.skland.com/web/v1/user/auth/generate_cred_by_code
 refresh_token_url = "https://zonai.skland.com/web/v1/auth/refresh"
 
 
-def generate_signature(path, body_or_query):
+def generate_signature(path, body_or_query, time_offset=0):
     """
     获得签名头
     接口地址+方法为Get请求？用query否则用body+时间戳+ 请求头的四个重要参数（dId，platform，timestamp，vName）.toJSON()
@@ -73,10 +73,11 @@ def generate_signature(path, body_or_query):
     再将加密后的字符串做MD5即得到sign
     :param path: 请求路径（不包括网址）
     :param body_or_query: 如果是GET，则是它的query。POST则为它的body
-    :return: 计算完毕的sign
+    :param time_offset: 时间偏移量（秒），用于处理服务器时间偏差
+    :return: 计算完毕的sign和header_ca
     """
-    # 总是说请勿修改设备时间，yj服务器似乎修复了，原始时间戳测试可以正常使用 
-    t = str(int(time.time()))
+    # 使用指定的时间偏移量计算时间戳
+    t = str(int(time.time()) + time_offset)
     token = http_local.token.encode('utf-8')
     header_ca = json.loads(json.dumps(header_for_sign))
     header_ca['timestamp'] = t
@@ -84,19 +85,83 @@ def generate_signature(path, body_or_query):
     s = path + body_or_query + t + header_ca_str
     hex_s = hmac.new(token, s.encode('utf-8'), hashlib.sha256).hexdigest()
     md5 = hashlib.md5(hex_s.encode('utf-8')).hexdigest().encode('utf-8').decode('utf-8')
-    logging.info(f'算出签名: {md5}')
+    logging.info(f'算出签名: {md5}, 时间偏移: {time_offset}秒')
     return md5, header_ca
 
 
-def get_sign_header(url: str, method, body, h):
+def get_sign_header(url: str, method, body, h, time_offset=0):
+    """
+    获取签名请求头
+    :param url: 请求URL
+    :param method: 请求方法（GET/POST）
+    :param body: 请求体（POST时使用）
+    :param h: 基础请求头
+    :param time_offset: 时间偏移量（秒），用于处理服务器时间偏差
+    :return: 带有签名的请求头
+    """
     p = parse.urlparse(url)
-    if method.lower() == 'get':
-        h['sign'], header_ca = generate_signature(p.path, p.query)
-    else:
-        h['sign'], header_ca = generate_signature(p.path, json.dumps(body) if body is not None else '')
-    for i in header_ca:
-        h[i] = header_ca[i]
+    body_or_query = p.query if method.lower() == 'get' else (json.dumps(body) if body is not None else '')
+    
+    sign, header_ca = generate_signature(p.path, body_or_query, time_offset)
+    
+    h['sign'] = sign
+    for key in header_ca:
+        h[key] = header_ca[key]
     return h
+
+
+def request_with_time_retry(url: str, method: str, body=None, headers=None):
+    """
+    带时间偏移重试的请求函数
+    当请求返回时间相关错误时，自动尝试从-5秒到+5秒的时间偏移
+    :param url: 请求URL
+    :param method: 请求方法（GET/POST）
+    :param body: 请求体
+    :param headers: 请求头（会被修改）
+    :return: 请求响应
+    """
+    # 时间偏移列表：先尝试默认时间（0偏移），然后按顺序尝试-5到+5秒
+    time_offsets = [-5,-3, -1, 2, 4, 5]
+    
+    # 保存额外的请求头（非签名相关的），在重试时保留
+    extra_headers = {}
+    if headers:
+        # 签名相关的字段
+        sign_fields = ['sign', 'platform', 'timestamp', 'dId', 'vName']
+        for key, value in headers.items():
+            if key not in sign_fields:
+                extra_headers[key] = value
+    
+    for offset in time_offsets:
+        # 为每次重试创建新的请求头副本，包含额外的请求头
+        current_headers = extra_headers.copy()
+        
+        # 使用当前时间偏移生成签名
+        get_sign_header(url, method, body, current_headers, offset)
+        
+        try:
+            if method.lower() == 'get':
+                resp = requests.get(url, headers=current_headers)
+            else:
+                resp = requests.post(url, headers=current_headers, json=body)
+            
+            resp_json = resp.json()
+            
+            # 检查是否为时间相关错误
+            error_msg = resp_json.get('message', '')
+            if '请勿修改设备本地时间' in error_msg:
+                logging.info(f'请求返回时间错误，尝试时间偏移: {offset}秒')
+                continue
+            
+            # 请求成功或非时间相关错误，返回响应
+            return resp
+        
+        except Exception as e:
+            logging.debug(f'请求失败 (偏移 {offset}秒): {e}')
+            continue
+    
+    # 如果所有偏移都尝试失败，抛出异常
+    raise Exception('所有时间偏移尝试均失败，请检查系统时间')
 
 
 def login_by_code():
@@ -166,8 +231,8 @@ def get_cred(grant):
 
 
 def refresh_token():
-    headers = get_sign_header(refresh_token_url, 'get', None, http_local.header)
-    resp = requests.get(refresh_token_url, headers=headers).json()
+    # 使用带时间重试的请求函数
+    resp = request_with_time_retry(refresh_token_url, 'get', None, http_local.header.copy()).json()
     if resp.get('code') != 0:
         raise Exception(f'刷新token失败:{resp["message"]}')
     http_local.token = resp['data']['token']
@@ -175,7 +240,8 @@ def refresh_token():
 
 def get_binding_list():
     v = []
-    resp = requests.get(binding_url, headers=get_sign_header(binding_url, 'get', None, http_local.header)).json()
+    # 使用带时间重试的请求函数
+    resp = request_with_time_retry(binding_url, 'get', None, http_local.header.copy()).json()
 
     if resp['code'] != 0:
         logging.error(f"请求角色列表出现问题：{resp['message']}")
@@ -200,8 +266,8 @@ def sign_for_arknights(data: dict):
         'uid': data.get('uid')
     }
     url = sign_url_mapping['arknights']
-    headers = get_sign_header(url, 'post', body, http_local.header)
-    resp = requests.post(url, headers=headers, json=body).json()
+    # 使用带时间重试的请求函数
+    resp = request_with_time_retry(url, 'post', body, http_local.header.copy()).json()
     game_name = data.get('gameName')
     channel = data.get("channelName")
     nickname = data.get('nickName') or ''
@@ -244,7 +310,8 @@ def sign_for_endfield(data: dict):
 
 def do_sign_for_endfield(role: dict):
     url = sign_url_mapping['endfield']
-    headers = get_sign_header(url, 'post', None, http_local.header)
+    # 准备请求头，包含额外的必要字段
+    headers = http_local.header.copy()
     headers.update({
         'Content-Type': 'application/json',
         # FIXME b服不知道是不是这样
@@ -253,7 +320,8 @@ def do_sign_for_endfield(role: dict):
         'referer': 'https://game.skland.com/',
         'origin': 'https://game.skland.com/'
     })
-    return requests.post(url, headers=headers)
+    # 使用带时间重试的请求函数
+    return request_with_time_retry(url, 'post', None, headers)
 
 
 def do_sign(cred_resp):
